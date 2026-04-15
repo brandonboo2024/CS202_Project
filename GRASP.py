@@ -2,6 +2,8 @@ import sys
 import time
 import heapq
 import random
+import csv
+import os
 
 # ==========================================
 # 1. PARSER MODULE
@@ -154,25 +156,59 @@ def parallel_sgs_grasp(n, K, durations, resource_reqs, successors, capacities, p
     # The makespan is the start time of the dummy end node (n + 1)
     return start_times[n + 1], start_times
 
-# ==========================================
-# 3. MAIN EXECUTION & TIME MANAGEMENT
-# ==========================================
-def solve():
-    # Perf_counter is the highest resolution clock in Python
-    time_limit = 29.5 
-    start_timer = time.perf_counter()
+def validate_schedule(start_times, n, K, predecessors_count, durations, resource_reqs, successors, capacities):
+    """
+    Checks a generated schedule for precedence and resource violations.
+    Modified to be SILENT on success so it doesn't flood the console during batch processing.
+    """
+    in_degree = predecessors_count[:]
+    topo_order = []
+    queue = [i for i in range(n + 2) if in_degree[i] == 0]
     
-    if len(sys.argv) < 2:
-        print("Usage: python solver.py <instance_file.SCH>")
-        return
+    while queue:
+        node = queue.pop(0)
+        topo_order.append(node)
+        for succ in successors[node]:
+            if succ > node: 
+                in_degree[succ] -= 1
+                if in_degree[succ] == 0:
+                    queue.append(succ)
+                    
+    if len(topo_order) != n + 2:
+        return False, "CYCLE DETECTED"
 
-    file_path = sys.argv[1]
+    for j in topo_order:
+        for succ in successors[j]:
+            if succ > j:
+                finish_j = start_times[j] + durations[j]
+                if start_times[succ] < finish_j:
+                    return False, f"PRECEDENCE VIOLATION: Task {succ} starts before {j} finishes."
     
-    # 1. Parse File
+    makespan = start_times[n + 1]
+    
+    for t in range(makespan):
+        current_usage = [0] * K
+        for i in range(1, n + 1):
+            if start_times[i] <= t < (start_times[i] + durations[i]):
+                for k in range(K):
+                    current_usage[k] += resource_reqs[i][k]
+                    
+        for k in range(K):
+            if current_usage[k] > capacities[k]:
+                return False, f"RESOURCE VIOLATION at t={t} for resource {k}."
+
+    return True, "VALID"
+
+# ==========================================
+# 3. SINGLE INSTANCE SOLVER
+# ==========================================
+def solve_instance(file_path, time_limit=29.5):
+    """
+    Solves a single instance and returns the best makespan and start times.
+    """
+    start_timer = time.perf_counter()
     n, K, durations, resource_reqs, successors, predecessors_count, capacities = parse_psplib(file_path)
     
-    # 2. Precompute Static Heuristic
-    # Simple example: prioritize tasks that take a long time and unlock many successors
     heuristic_scores = [0] * (n + 2)
     for i in range(n + 2):
         heuristic_scores[i] = durations[i] + len(successors[i])
@@ -180,11 +216,8 @@ def solve():
     best_makespan = float('inf')
     best_start_times = []
     
-    # 3. GRASP Loop (The Anytime Algorithm)
     iterations = 0
     while time.perf_counter() - start_timer < time_limit:
-        
-        # Pass 1: Force purely greedy (alpha=1) to guarantee at least one safe baseline
         current_alpha = 1 if iterations == 0 else random.randint(2, 5)
         
         makespan, s_times = parallel_sgs_grasp(
@@ -198,91 +231,83 @@ def solve():
             
         iterations += 1
 
-    # 4. Strict Formatting Output
-    # The guidelines state: "Print start times for activities 1 through n to stdout, one integer per line"
-    # Run the validation check
-    is_valid = validate_schedule(
-        best_start_times, n, K, predecessors_count, durations, resource_reqs, 
-        successors, capacities
-    )
-    
-    # Only print the stdout if it actually passed
-    if is_valid:
-        for i in range(1, n + 1):
-            print(best_start_times[i])
+    # Validate before returning
+    if best_start_times:
+        is_valid, msg = validate_schedule(best_start_times, n, K, predecessors_count, durations, resource_reqs, successors, capacities)
+        if not is_valid:
+            return "INVALID", msg
+            
+        # Return makespan and the start times for tasks 1 through n
+        return best_makespan, best_start_times[1:n+1] 
     else:
-        print("Algorithm failed to find a valid schedule.")
-        
-        
-        
-def validate_schedule(start_times, n, K, predecessors_count, durations, resource_reqs, successors, capacities):
-    """
-    Checks a generated schedule for precedence and resource violations.
-    Returns True if valid, False otherwise.
-    """
-    print("\n--- Running Schedule Validation ---")
+        return "FAILED", "No schedule found"
+
+# ==========================================
+# 4. BATCH PROCESSOR
+# ==========================================
+def run_batch():
+    # The folders you want to scan
+    folders_to_scan = ['sm_j10', 'sm_j20']
     
-    # ---------------------------------------------------------
-    # 1. PRECEDENCE CHECK
-    # ---------------------------------------------------------
-    in_degree = predecessors_count[:]
-    topo_order = []
-    queue = [i for i in range(n + 2) if in_degree[i] == 0]
+    # Time limit PER INSTANCE (Set to 2.0 seconds for quick testing)
+    TIME_BUDGET_PER_FILE = 29.5 
     
-    while queue:
-        node = queue.pop(0)
-        topo_order.append(node)
-        for succ in successors[node]:
-            # Remember: We only care about forward edges
-            if succ > node: 
-                in_degree[succ] -= 1
-                if in_degree[succ] == 0:
-                    queue.append(succ)
+    output_filename = "batch_results.csv"
+    
+    print(f"Starting batch process. Output will be saved to {output_filename}...")
+    
+    # Open a CSV file to write our table
+    with open(output_filename, mode='w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        # Write the header row
+        writer.writerow(["Directory", "Filename", "Makespan", "Start_Times (1 to n)", "Status"])
+        
+        for folder in folders_to_scan:
+            # Check if the folder actually exists on your computer
+            if not os.path.exists(folder):
+                print(f"Warning: Folder '{folder}' not found. Skipping.")
+                continue
+                
+            # Iterate through all files in the directory
+            for filename in os.listdir(folder):
+                # Look for .SCH, .sm, or .rcp files
+                if filename.upper().endswith('.SCH') or filename.upper().endswith('.SM'):
+                    file_path = os.path.join(folder, filename)
                     
-    if len(topo_order) != n + 2:
-        print("❌ CRITICAL ERROR: The graph contains a cycle!")
-        return False
-
-    # Now sweep through the start times in perfect topological order
-    for j in topo_order:
-        for succ in successors[j]:
-            if succ > j:
-                finish_j = start_times[j] + durations[j]
-                if start_times[succ] < finish_j:
-                    print(f"❌ PRECEDENCE VIOLATION detected during Topo Sweep:")
-                    print(f"   Task {succ} starts at {start_times[succ]} before Task {j} finishes at {finish_j}.")
-                    return False
-    
-    print("✅ Precedence Constraints: Passed")
-
-    # ---------------------------------------------------------
-    # 2. RESOURCE CHECK (Time-Step Sweep)
-    # ---------------------------------------------------------
-    makespan = start_times[n + 1]
-    
-    # We check every single time unit from t=0 up to the makespan
-    for t in range(makespan):
-        current_usage = [0] * K
-        
-        # Look at every real task (1 to n)
-        for i in range(1, n + 1):
-            # Is task 'i' currently running at time 't'?
-            if start_times[i] <= t < (start_times[i] + durations[i]):
-                for k in range(K):
-                    current_usage[k] += resource_reqs[i][k]
+                    print(f"Processing {folder}/{filename}...", end="", flush=True)
                     
-        # Verify usage doesn't exceed total capacities
-        for k in range(K):
-            if current_usage[k] > capacities[k]:
-                print(f"❌ RESOURCE VIOLATION:")
-                print(f"   At time t={t}, Resource {k} usage is {current_usage[k]}, "
-                      f"which exceeds the capacity of {capacities[k]}.")
-                return False
+                    # Run the algorithm!
+                    makespan, result_data = solve_instance(file_path, time_limit=TIME_BUDGET_PER_FILE)
+                    
+                    # Format output for the CSV
+                    if isinstance(makespan, int):
+                        # Success
+                        status = "Valid"
+                        start_times_str = str(result_data)
+                        print(f" Done! Makespan: {makespan}")
+                    else:
+                        # Failed or Invalid
+                        status = result_data # the error message
+                        start_times_str = "[]"
+                        print(f" Error: {status}")
+                        
+                    # Write the row to the table
+                    writer.writerow([folder, filename, makespan, start_times_str, status])
 
-    print("✅ Resource Constraints: Passed")
-    print(f"✅ VALIDATION SUCCESSFUL! Final Makespan: {makespan}")
-    print("-----------------------------------\n")
-    return True
+    print(f"\nBatch processing complete! Check {output_filename} for your table.")
 
 if __name__ == "__main__":
-    solve()
+    # If the user provides a file in the console (e.g. python solver.py PSP1.SCH), just solve that one file.
+    if len(sys.argv) > 1:
+        file_path = sys.argv[1]
+        print(f"Solving single instance: {file_path}")
+        makespan, start_times = solve_instance(file_path, time_limit=29.5)
+        if isinstance(makespan, int):
+             for st in start_times:
+                 print(st)
+        else:
+             print(f"Failed: {start_times}")
+             
+    # If the user just runs `python solver.py` with no arguments, run the batch script!
+    else:
+        run_batch()
