@@ -11,53 +11,68 @@ import os
 def parse_psplib(file_path):
     """
     Parses a pure numerical .SCH file block by block.
+    Dynamically supports both RCPSP/max (with mode/lags) and Standard RCPSP formats.
     """
     with open(file_path, 'r') as f:
-        # Read all lines, strip whitespace, and ignore completely empty lines
         lines = [line.strip() for line in f.readlines() if line.strip()]
         
     # 1. Parse Metadata (First line)
-    # Format: n (jobs), K (resources), [flag], [flag]
     meta_data = lines[0].split()
     n = int(meta_data[0]) 
     K = int(meta_data[1])
     
-    # Initialize arrays (n + 2 to account for dummy start 0 and dummy end n+1)
+    # DETECT FORMAT: If the first line has > 2 items (like "10 5 0 0"), it has a Mode column.
+    has_mode = len(meta_data) > 2
+    
     durations = [0] * (n + 2)
     resource_reqs = [[0] * K for _ in range(n + 2)]
     successors = [[] for _ in range(n + 2)]
     predecessors_count = [0] * (n + 2)
     
     # 2. Parse Precedence Block (Next n + 2 lines)
-    # Format: TaskID, mode, num_successors, succ1, succ2... [lag1], [lag2]...
-    # We loop from line index 1 to (n + 2)
     for i in range(1, n + 3):
         parts = lines[i].split()
         task_id = int(parts[0])
-        num_successors = int(parts[2])
         
+        # Adjust target columns based on file format
+        if has_mode:
+            num_successors = int(parts[2])
+            succ_start_idx = 3
+        else:
+            num_successors = int(parts[1])
+            succ_start_idx = 2
+            
         succ_list = []
         for j in range(num_successors):
-            succ_id = int(parts[3 + j])
+            succ_id = int(parts[succ_start_idx + j])
             
-            # THE FIX: Only accept forward edges to maintain a strict DAG
             if succ_id > task_id:
                 succ_list.append(succ_id)
                 predecessors_count[succ_id] += 1 
                 
         successors[task_id] = succ_list
+
+    for i in range(1, n + 1):
+        if len(successors[i]) == 0:
+            successors[i].append(n + 1)
+            predecessors_count[n + 1] += 1
         
     # 3. Parse Duration & Resource Block (Next n + 2 lines)
-    # Format: TaskID, mode, duration, req1, req2... reqK
     offset = n + 3
     for i in range(offset, offset + n + 2):
         parts = lines[i].split()
         task_id = int(parts[0])
-        durations[task_id] = int(parts[2])
         
-        # Extract resource requirements for this task
+        # Adjust target columns based on file format
+        if has_mode:
+            durations[task_id] = int(parts[2])
+            req_start_idx = 3
+        else:
+            durations[task_id] = int(parts[1])
+            req_start_idx = 2
+            
         for k in range(K):
-             resource_reqs[task_id][k] = int(parts[3 + k])
+             resource_reqs[task_id][k] = int(parts[req_start_idx + k])
              
     # 4. Parse Resource Capacities (Last line)
     capacity_line = lines[offset + n + 2].split()
@@ -202,7 +217,7 @@ def validate_schedule(start_times, n, K, predecessors_count, durations, resource
 # ==========================================
 # 3. SINGLE INSTANCE SOLVER
 # ==========================================
-def solve_instance(file_path, time_limit=29.5):
+def solve_instance(file_path, time_limit=0.2):
     """
     Solves a single instance and returns the best makespan and start times.
     """
@@ -250,7 +265,7 @@ def run_batch():
     folders_to_scan = ['sm_j10', 'sm_j20']
     
     # Time limit PER INSTANCE (Set to 2.0 seconds for quick testing)
-    TIME_BUDGET_PER_FILE = 29.5 
+    TIME_BUDGET_PER_FILE = 0.2
     
     output_filename = "batch_results.csv"
     
